@@ -752,12 +752,19 @@ class TestLockoutClosingBaseStateUpdate:
 
 class TestManualUnknownClearsShadingState:
     """
-    Regression for #447: When the user manually moves the cover to a position
-    that does not match any defined position (open/close/shading/ventilate),
-    the helper must clear `shd`, the pending phase (`pnd`), the pending fire
-    time (`ts.due`) and the retry anchor (`ts.arm`). Otherwise a stale `shd=1`
-    (e.g. set by a prior lockout-blocked shading-start) lets shading-end later
-    override the manual move before reset_override_timeout elapses.
+    Regression for #447 (default flag state): When the user manually moves the
+    cover to a position that does not match any defined position
+    (open/close/shading/ventilate), the helper must clear `shd`, the pending
+    phase (`pnd`), the pending fire time (`ts.due`) and the retry anchor
+    (`ts.arm`). Otherwise a stale `shd=1` (e.g. set by a prior lockout-blocked
+    shading-start) lets shading-end later override the manual move before
+    `reset_override_timeout` elapses.
+
+    The `auto_recover_after_manual_override` option (issue #501) makes `shd` /
+    `ts.shd` conditional. With `is_manual_recovery_enabled == false` (the
+    default) the original #447 invariants must still hold; with the option
+    enabled, `shd` and `ts.shd` are preserved so the recovery cascade can
+    return to the prior shading state. Both cases are verified below.
     """
 
     def _load_blueprint(self) -> dict:
@@ -780,11 +787,32 @@ class TestManualUnknownClearsShadingState:
         )
         return variables_step["variables"].get("update_values", {})
 
-    def test_clears_shd(self):
+    def _eval(self, value, recovery_enabled: bool, helper_shd: int = 1, helper_ts_shd: int = 1234567890):
+        """Render a Jinja expression (or pass through a literal) as it would be
+        evaluated at runtime."""
+        if not isinstance(value, str) or "{{" not in value:
+            return value
+        env = make_jinja_env()
+        return env.from_string(value).render(
+            is_manual_recovery_enabled=recovery_enabled,
+            helper_json={"shd": helper_shd, "ts": {"shd": helper_ts_shd}},
+        )
+
+    def test_clears_shd_when_recovery_disabled(self):
         update_values = self._get_update_values()
-        assert update_values.get("shd") == 0, (
-            f"Expected update_values.shd == 0 but got {update_values.get('shd')!r}. "
+        rendered = self._eval(update_values.get("shd"), recovery_enabled=False, helper_shd=1)
+        assert int(rendered) == 0, (
+            f"Expected shd == 0 with recovery disabled but got {rendered!r}. "
             "Stale shd=1 lets shading-end later override the manual move."
+        )
+
+    def test_preserves_shd_when_recovery_enabled(self):
+        update_values = self._get_update_values()
+        rendered = self._eval(update_values.get("shd"), recovery_enabled=True, helper_shd=1)
+        assert int(rendered) == 1, (
+            f"Expected shd preserved (==1) with recovery enabled but got {rendered!r}. "
+            "Recovery cascade needs the shading intent to be alive across the "
+            "manual override."
         )
 
     def test_sets_man(self):
@@ -807,13 +835,29 @@ class TestManualUnknownClearsShadingState:
             "Retry anchor must be reset when manual move cancels the sequence."
         )
 
-    def test_sets_ts_man_and_shd(self):
+    def test_sets_ts_man(self):
         update_values = self._get_update_values()
         ts = update_values.get("ts", {})
         assert ts.get("man") == "now"
-        assert ts.get("shd") == "now", (
+
+    def test_sets_ts_shd_when_recovery_disabled(self):
+        update_values = self._get_update_values()
+        ts = update_values.get("ts", {})
+        rendered = self._eval(ts.get("shd"), recovery_enabled=False)
+        assert rendered == "now", (
+            f"Expected ts.shd == 'now' with recovery disabled but got {rendered!r}. "
             "ts.shd must be touched so the helper_update guard can refresh it "
             "when shd transitions from 1 to 0."
+        )
+
+    def test_preserves_ts_shd_when_recovery_enabled(self):
+        update_values = self._get_update_values()
+        ts = update_values.get("ts", {})
+        rendered = self._eval(ts.get("shd"), recovery_enabled=True, helper_ts_shd=1234567890)
+        assert int(rendered) == 1234567890, (
+            f"Expected ts.shd preserved (==helper_json.ts.shd) with recovery enabled "
+            f"but got {rendered!r}. The recovery cascade reads ts.shd to decide "
+            "whether shading was active before the manual move."
         )
 
 
@@ -2003,6 +2047,207 @@ class TestForceDisabledRecoveryBranchOrder:
             "OPEN(base=opn) recovery branch must not check for tilted window — "
             "BASE=OPN beats VENT in the new cascade."
         )
+
+
+class TestManualOverrideResetRecoveryCascade:
+    """
+    Issue #501: When `auto_recover_after_manual_override` is enabled, the
+    "Reset manual detection" branch re-evaluates the current target after the
+    timed/fixed-time reset fires and drives the cover there. The cascade has
+    five recovery sub-branches: SHADING, LOCKOUT (window-open),
+    VENTILATION (window-tilted), OPEN (base=opn), CLOSE (base=cls).
+
+    The OPEN and CLOSE base-state branches must additionally guard against
+    the `time_control_disabled` mode where the priority cascade resolves to
+    `bas=opn` (default) 24/7 — without a time-window guard, a 04:16 reset
+    after a manual close-for-the-night would drive the cover open. The guard
+    is `not is_time_control_disabled and should_be_open_now/closed_now`.
+    """
+
+    def _load_blueprint(self) -> dict:
+        return _load_blueprint_yaml(BLUEPRINT_PATH)
+
+    def _find_recovery_choose(self) -> list:
+        """Locate the recovery cascade's `choose:` list. It lives inside the
+        outer 'Manual reset: recovery enabled — re-evaluate target and drive'
+        branch."""
+        blueprint = self._load_blueprint()
+        outer = _find_branch_by_alias(
+            blueprint,
+            "Manual reset: recovery enabled — re-evaluate target and drive",
+        )
+        assert outer is not None, "Outer recovery branch not found"
+        seq = outer.get("sequence", [])
+        # Find the inner choose step (after the variables: recover_shade step)
+        for step in seq:
+            if isinstance(step, dict) and "choose" in step and isinstance(step["choose"], list):
+                # Sanity check: this is the recovery cascade, not some other choose
+                aliases = [b.get("alias", "") for b in step["choose"] if isinstance(b, dict)]
+                if any("Manual reset recovery" in a for a in aliases):
+                    return step["choose"]
+        raise AssertionError("Recovery cascade choose: list not found")
+
+    def _branch(self, alias: str) -> dict:
+        choose = self._find_recovery_choose()
+        for b in choose:
+            if isinstance(b, dict) and b.get("alias") == alias:
+                return b
+        raise AssertionError(f"Recovery branch {alias!r} not found")
+
+    def test_outer_branch_gated_by_recovery_flag_and_no_force(self):
+        blueprint = self._load_blueprint()
+        outer = _find_branch_by_alias(
+            blueprint,
+            "Manual reset: recovery enabled — re-evaluate target and drive",
+        )
+        assert outer is not None
+        conds = " ".join(c for c in outer.get("conditions", []) if isinstance(c, str))
+        assert "is_manual_recovery_enabled" in conds, (
+            "Recovery cascade must be gated by `is_manual_recovery_enabled`."
+        )
+        assert "helper_state_force == 'non'" in conds, (
+            "Recovery cascade must be skipped when a force is active."
+        )
+        assert "t_reset_position" not in conds, (
+            "Position-based reset keeps original behavior — recovery cascade "
+            "should not run on `t_reset_position`."
+        )
+
+    def test_recovery_open_base_branch_has_time_window_guard(self):
+        """The 04:16-night-close fix: the OPEN(base=opn) recovery branch must
+        require `not is_time_control_disabled and should_be_open_now`."""
+        branch = self._branch("Manual reset recovery: return to OPEN (base=opn)")
+        conds = " ".join(c for c in branch.get("conditions", []) if isinstance(c, str))
+        assert "not is_time_control_disabled" in conds, (
+            "OPEN(base=opn) recovery branch must skip when `time_control_disabled` "
+            "is set, otherwise a 04:16 reset would drive the cover open."
+        )
+        assert "should_be_open_now" in conds, (
+            "OPEN(base=opn) recovery branch must require `should_be_open_now` "
+            "so that recovery only happens during the configured opening phase."
+        )
+
+    def test_recovery_close_base_branch_has_time_window_guard(self):
+        """Same guard as the OPEN branch, mirrored for CLOSE."""
+        branch = self._branch("Manual reset recovery: return to CLOSE (base=cls)")
+        conds = " ".join(c for c in branch.get("conditions", []) if isinstance(c, str))
+        assert "not is_time_control_disabled" in conds, (
+            "CLOSE(base=cls) recovery branch must skip when `time_control_disabled` "
+            "is set, otherwise the cascade would drive closed during the day."
+        )
+        assert "should_be_closed_now" in conds, (
+            "CLOSE(base=cls) recovery branch must require `should_be_closed_now`."
+        )
+
+    def test_recovery_shading_branch_uses_live_recheck(self):
+        """The SHADING recovery branch must re-check live conditions (not the
+        stored `shd` flag), because the manual-detection branches can clear
+        `shd` to 0 (when the recovery option is disabled)."""
+        branch = self._branch(
+            "Manual reset recovery: return to SHADING (conditions still valid)"
+        )
+        conds = " ".join(c for c in branch.get("conditions", []) if isinstance(c, str))
+        assert "recover_shade" in conds, (
+            "SHADING recovery must read `recover_shade` (the live re-check), "
+            "not the stored `shd` flag."
+        )
+
+    def test_recovery_shading_branch_skips_when_user_drove_below_shading(self):
+        """User-intent guard: if the user manually drove the cover *more closed*
+        than the shading position (e.g. fully closed for darkness), the SHADING
+        recovery branch must not undo that move. The branch only fires when
+        the cover is currently *above* (lighter than) the shading position."""
+        branch = self._branch(
+            "Manual reset recovery: return to SHADING (conditions still valid)"
+        )
+        conds = " ".join(c for c in branch.get("conditions", []) if isinstance(c, str))
+        assert "current_above_shading" in conds, (
+            "SHADING recovery must require `current_above_shading` so it does "
+            "not override a user move that went darker than shading would."
+        )
+
+    def test_recovery_open_base_branch_skips_when_user_drove_to_close(self):
+        """User-intent guard: if the user manually drove the cover fully closed
+        (or below close), the OPEN(base=opn) recovery branch must not undo
+        that move."""
+        branch = self._branch("Manual reset recovery: return to OPEN (base=opn)")
+        conds = " ".join(c for c in branch.get("conditions", []) if isinstance(c, str))
+        assert "in_close_position" in conds and "not in_close_position" in conds, (
+            "OPEN(base=opn) recovery must skip when the cover is currently in "
+            "the close position."
+        )
+        assert "current_below_close" in conds, (
+            "OPEN(base=opn) recovery must skip when the cover is currently below "
+            "the close position (handles position_tolerance / awning inversion)."
+        )
+
+    def test_recovery_close_base_branch_skips_when_user_drove_to_open(self):
+        """User-intent guard: symmetric to OPEN."""
+        branch = self._branch("Manual reset recovery: return to CLOSE (base=cls)")
+        conds = " ".join(c for c in branch.get("conditions", []) if isinstance(c, str))
+        assert "in_open_position" in conds and "not in_open_position" in conds, (
+            "CLOSE(base=cls) recovery must skip when the cover is currently in "
+            "the open position."
+        )
+        assert "current_above_open" in conds, (
+            "CLOSE(base=cls) recovery must skip when the cover is currently above "
+            "the open position (handles position_tolerance / awning inversion)."
+        )
+
+    def test_recovery_branch_order_open_before_close(self):
+        """OPEN(base=opn) must come before CLOSE(base=cls) so a `bas=opn`
+        helper picks OPEN, not the CLOSE branch via fall-through."""
+        choose = self._find_recovery_choose()
+        aliases = [b.get("alias") for b in choose if isinstance(b, dict)]
+        idx_open = aliases.index("Manual reset recovery: return to OPEN (base=opn)")
+        idx_close = aliases.index("Manual reset recovery: return to CLOSE (base=cls)")
+        assert idx_open < idx_close
+
+    def test_default_clears_man_when_no_recovery_branch_matches(self):
+        """When recovery is enabled but no branch matches (e.g. window closed,
+        no shading, time_control_disabled), only the manual flag is cleared
+        and the cover stays where the user left it."""
+        blueprint = self._load_blueprint()
+        outer = _find_branch_by_alias(
+            blueprint,
+            "Manual reset: recovery enabled — re-evaluate target and drive",
+        )
+        seq = outer.get("sequence", [])
+        choose_step = next(
+            (s for s in seq if isinstance(s, dict) and "choose" in s and "default" in s),
+            None,
+        )
+        assert choose_step is not None, "Recovery cascade missing `default:` fall-through"
+        default_steps = choose_step["default"]
+        # First step must be variables with man: 0
+        var_step = next((s for s in default_steps if isinstance(s, dict) and "variables" in s), None)
+        assert var_step is not None
+        update_values = var_step["variables"].get("update_values", {})
+        assert update_values.get("man") == 0, (
+            "Default fall-through must clear `man` so the override is lifted "
+            "even when no recovery target matches."
+        )
+
+    def test_recovery_disabled_keeps_legacy_clear_man_only(self):
+        """When `is_manual_recovery_enabled` is false (default), the outer
+        `Reset manual detection` branch must fall through to the legacy
+        `default:` path that just clears the `man` flag."""
+        blueprint = self._load_blueprint()
+        outer = _find_branch_by_alias(blueprint, "Reset manual detection")
+        assert outer is not None
+        seq = outer.get("sequence", [])
+        # Top-level choose has a default that handles recovery-disabled
+        top_choose = next((s for s in seq if isinstance(s, dict) and "choose" in s), None)
+        assert top_choose is not None
+        default_steps = top_choose.get("default", [])
+        var_step = next(
+            (s for s in default_steps if isinstance(s, dict) and "variables" in s), None
+        )
+        assert var_step is not None, (
+            "Legacy default path must set `update_values: {man: 0}` so behavior "
+            "without the recovery option is unchanged."
+        )
+        assert var_step["variables"].get("update_values", {}).get("man") == 0
 
 
 class TestForcePauseDisabledHasBackgroundOpen:
