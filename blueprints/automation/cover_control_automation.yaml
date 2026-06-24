@@ -5417,6 +5417,19 @@ actions:
                       - "{{ trigger.id | regex_match('^(t_shading_start_pending)') }}"
                       - "{{ not helper_state_pending_start }}" # Not if a pending is already active
                       - "{{ not helper_state_pending_end }}" # Mutual-exclusivity guard against misconfigured conditions
+                      # User-intent guard: do not arm a new shading-start when the
+                      # cover is currently more closed than the shading position
+                      # AND the last manual move is more recent than the last
+                      # auto-open event. In that case the cover is below shading
+                      # because the user moved it there (not because the cover is
+                      # closed overnight); arming a pending would later lift the
+                      # cover up to shading position, undoing the user's manual
+                      # darkening. If the user lifts the cover again, the next
+                      # sun-position transition will re-arm. The guard is paired
+                      # with the same check in the "Start Shading" sub-branch.
+                      - or:
+                          - "{{ not position_comparisons.current_below_shading }}"
+                          - "{{ helper_ts_open > helper_ts_man }}"
                     sequence:
                       - variables:
                           shading_start_due: >-
@@ -5506,10 +5519,19 @@ actions:
                                       - and:
                                           - "{{ is_cover_tilt_enabled_and_possible }}"
                                           - "{{ position_comparisons.current_above_shading or current_position == shading_position }}"
-                                      # Cover below the shading position (e.g. closed overnight) while the base state wants it open: raise to the shading cap
+                                      # Cover below the shading position (e.g. closed overnight) while the base state wants it open: raise to the shading cap.
+                                      # User-intent guard: only lift from below
+                                      # when the auto-open event is more recent
+                                      # than the last manual move. Otherwise the
+                                      # user manually drove the cover below shading
+                                      # (e.g. fully closed for darkness) and the
+                                      # stale `bas=opn` must not lift the cover.
+                                      # Paired with the same check on the
+                                      # pending-arm branch above.
                                       - and:
                                           - "{{ position_comparisons.current_below_shading }}"
                                           - "{{ effective_state == 'opn' }}"
+                                          - "{{ helper_ts_open > helper_ts_man }}"
                                   - "{{ is_shading_allowed_window }}" # Shading during daytime window
                                   - "{{ resident_flags.allow_shade }}"
                                 sequence:

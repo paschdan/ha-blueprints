@@ -1100,6 +1100,86 @@ class TestShadingStartOuterIfGatesOnWindow:
         )
 
 
+class TestShadingStartUserIntentGuardWhenManualBelowShading:
+    """
+    Bug: User manually closed cover to position 0 (below shading position 16).
+    The unknown-manual branch correctly set `man=1` and (with the recovery
+    option enabled) preserved `shd=0`. While `man=1` was active, a sun-azimuth
+    `t_shading_start_pending_1` trigger fired and the "Shading detected. Save
+    next execution time and pending status" branch armed `pnd=beg`. After
+    the reset timeout cleared `man=0`, the `t_shading_start_execution`
+    trigger fired and the "Start Shading" sub-branch's "lift from below"
+    path (`current_below_shading AND effective_state == 'opn'`) drove the
+    cover UP to the shading position — undoing the user's manual darkening.
+
+    Root cause: the "lift from below" path treats `effective_state == 'opn'`
+    as a legitimate auto-open signal, but `bas=opn` is sticky and can be
+    weeks old. The user's manual close should win over a stale `bas=opn`.
+
+    Fix: both the pending-arm branch and the "Start Shading" lift-from-below
+    branch require `helper_ts_open > helper_ts_man` — i.e. the last auto-open
+    event is more recent than the last manual move. The legitimate use case
+    (cover was closed overnight by an automation, `ts.opn` is updated by the
+    morning `t_open_1` trigger, then sun enters shading window) still works
+    because the t_open_1 handler refreshes `ts.opn` before the shading-start
+    pending arms.
+    """
+
+    def _load_blueprint(self) -> dict:
+        return _load_blueprint_yaml(BLUEPRINT_PATH)
+
+    def test_pending_arm_branch_has_user_intent_guard(self):
+        branch = _find_branch_by_alias(
+            self._load_blueprint(),
+            "Shading detected. Save next execution time and pending status",
+        )
+        assert branch is not None
+        flat = yaml.safe_dump(branch.get("conditions", []))
+        assert "current_below_shading" in flat, (
+            "Pending-arm branch must guard against arming when the cover is "
+            "currently below the shading position."
+        )
+        assert "helper_ts_open" in flat and "helper_ts_man" in flat, (
+            "Pending-arm branch must compare `helper_ts_open` and "
+            "`helper_ts_man` to distinguish a stale `bas=opn` (set weeks ago) "
+            "from a fresh auto-open event."
+        )
+
+    def test_start_shading_lift_branch_has_user_intent_guard(self):
+        """The 'lift from below' path of 'Start Shading' must also gate on
+        `helper_ts_open > helper_ts_man` as a defense-in-depth check (in
+        case a pending was already armed before the guard was tightened, or
+        before the user moved the cover)."""
+        blueprint = self._load_blueprint()
+        branch = _find_branch_by_alias(blueprint, "Start Shading")
+        assert branch is not None
+        # Find the `or:` block containing the `current_below_shading` clause
+        conds = branch.get("conditions", [])
+        or_block = next(
+            (c for c in conds if isinstance(c, dict) and "or" in c),
+            None,
+        )
+        assert or_block is not None, "Start Shading must have an `or:` position-check"
+        # Find the lift-from-below `and:` clause inside the `or:`
+        below_clause = None
+        for entry in or_block["or"]:
+            if isinstance(entry, dict) and "and" in entry:
+                and_flat = yaml.safe_dump(entry["and"])
+                if "current_below_shading" in and_flat:
+                    below_clause = entry["and"]
+                    break
+        assert below_clause is not None, (
+            "Start Shading must have a lift-from-below `and:` clause "
+            "(current_below_shading AND effective_state == 'opn')."
+        )
+        below_flat = yaml.safe_dump(below_clause)
+        assert "helper_ts_open" in below_flat and "helper_ts_man" in below_flat, (
+            "Lift-from-below clause must additionally require "
+            "`helper_ts_open > helper_ts_man` so a stale `bas=opn` does not "
+            "override a recent manual close."
+        )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Tests: Opening must not skip when a shading-start pending is stale (#514)
 # ─────────────────────────────────────────────────────────────────────────────
