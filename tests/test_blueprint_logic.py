@@ -2232,6 +2232,55 @@ class TestManualOverrideResetRecoveryCascade:
             "not the stored `shd` flag."
         )
 
+    def _recover_shade_expr(self) -> str:
+        """Extract the `recover_shade` Jinja expression from the recovery cascade
+        outer branch's `variables:` step."""
+        blueprint = self._load_blueprint()
+        outer = _find_branch_by_alias(
+            blueprint,
+            "Manual reset: recovery enabled — re-evaluate target and drive",
+        )
+        assert outer is not None
+        seq = outer.get("sequence", [])
+        var_step = next(
+            (s for s in seq if isinstance(s, dict) and "variables" in s),
+            None,
+        )
+        assert var_step is not None, "variables: step missing"
+        expr = var_step["variables"].get("recover_shade")
+        assert isinstance(expr, str) and "{{" in expr, (
+            f"recover_shade must be a Jinja expression, got {expr!r}"
+        )
+        return expr
+
+    def test_recover_shade_has_night_sanity_floor(self):
+        """Regression for the night-open case: when the user manually opens the
+        cover at night (e.g. 23:00 for fresh air), the reset timeout must NOT
+        drive the cover to the shading position. The user's degenerate
+        `shading_elevation_min=-90` makes `shading_start_conditions_met` evaluate
+        true at night, so `recover_shade` needs an independent sun-above-horizon
+        sanity floor on top of the user-configured conditions."""
+        expr = self._recover_shade_expr()
+        assert "current_sun_elevation" in expr, (
+            "recover_shade must include a sun-elevation check independent of "
+            "user-configured `shading_elevation_min`, so that a degenerate "
+            "elevation_min (e.g. -90°) cannot let night-time recovery to "
+            "shading fire."
+        )
+        # Verify the floor is `> 0` (sun above horizon) — using Jinja eval
+        env = make_jinja_env()
+        for elev, expected in [(-14.5, False), (-0.1, False), (0.0, False), (5.0, True), (45.0, True)]:
+            rendered = env.from_string("{{ " + expr.strip("{} ").strip() + " }}").render(
+                shading_start_conditions_met=True,
+                is_shading_allowed_window=True,
+                shading_end_conditions_met=False,
+                current_sun_elevation=elev,
+            )
+            assert (rendered == "True") == expected, (
+                f"recover_shade should be {expected} when elevation={elev} "
+                f"(other conditions true), got {rendered!r}"
+            )
+
     def test_recovery_shading_branch_skips_when_user_drove_below_shading(self):
         """User-intent guard: if the user manually drove the cover *more closed*
         than the shading position (e.g. fully closed for darkness), the SHADING

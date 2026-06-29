@@ -7406,8 +7406,16 @@ actions:
                   # Live re-check of shading: the manual-detection branches cleared
                   # `shd` to 0 (unless `is_manual_recovery_enabled` preserved it),
                   # so recovery treats the live conditions as the source of truth.
+                  # The sun-above-horizon clause is a sanity floor on top of the
+                  # user's configured shading conditions — it prevents recovery
+                  # to shading at night when a degenerate `shading_elevation_min`
+                  # (e.g. -90°) lets `shading_start_conditions_met` evaluate true
+                  # even with the sun below the horizon. Without this floor a
+                  # 23:00 manual open (e.g. for fresh air) followed by the reset
+                  # timeout would drive the cover to the shading position even
+                  # though no shading is actually warranted.
                   - variables:
-                      recover_shade: "{{ shading_start_conditions_met and is_shading_allowed_window and not shading_end_conditions_met }}"
+                      recover_shade: "{{ shading_start_conditions_met and is_shading_allowed_window and not shading_end_conditions_met and current_sun_elevation | float(default=-90) > 0 }}"
                   - choose:
                       - alias: "Manual reset recovery: return to SHADING (conditions still valid)"
                         conditions:
